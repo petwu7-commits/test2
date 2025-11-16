@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>实时唱歌音准分析 | PitchMaster</title>
+
+  <!-- TensorFlow.js + CREPE -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pitch-detection@0.0.3"></script>
+
+  <!-- Chart.js for waveform & pitch curve -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <style>
+    :root {
+      --bg: #0a0a1a;
+      --primary: #00f5ff;
+      --accent: #ff00aa;
+      --dark: #111;
+      --light: #eee;
+    }
+
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body {
+      background: var(--bg);
+      color: var(--light);
+      font-family: 'Segoe UI', sans-serif;
+      overflow: hidden;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+    }
+
+    canvas#bg { position: absolute; top:0; left:0; z-index:1; opacity:0.3; }
+    .container { z-index: 10; width: 90%; max-width: 1000px; }
+
+    h1 {
+      font-size: 2.8rem;
+      background: linear-gradient(90deg, var(--primary), var(--accent));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      text-align: center;
+      margin-bottom: 1rem;
+      text-shadow: 0 0 20px rgba(0,245,255,0.5);
+    }
+
+    .card {
+      background: rgba(20,20,40,0.7);
+      border-radius: 20px;
+      padding: 2rem;
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(0,245,255,0.2);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+      margin-bottom: 1.5rem;
+    }
+
+    button#startBtn {
+      background: linear-gradient(45deg, var(--primary), var(--accent));
+      border: none;
+      padding: 14px 32px;
+      font-size: 1.2rem;
+      border-radius: 50px;
+      color: white;
+      cursor: pointer;
+      transition: all 0.3s;
+      box-shadow: 0 0 20px rgba(0,245,255,0.4);
+    }
+    button#startBtn:hover { transform: scale(1.05); box-shadow: 0 0 30px rgba(0,245,255,0.6); }
+
+    .status {
+      text-align: center;
+      margin: 1rem 0;
+      font-size: 1.1rem;
+      color: #aaa;
+    }
+
+    .pitch-display {
+      text-align: center;
+      font-size: 3rem;
+      font-weight: bold;
+      margin: 1rem 0;
+      color: var(--primary);
+      text-shadow: 0 0 15px var(--primary);
+    }
+
+    .cents {
+      font-size: 1.5rem;
+      color: #ff00aa;
+    }
+
+    .charts {
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+
+    canvas { border-radius: 12px; background: var(--dark); }
+
+    @media (min-width: 768px) {
+      .charts { flex-direction: row; }
+      canvas { flex: 1; }
+    }
+
+    .particle {
+      position: absolute;
+      width: 4px;
+      height: 4px;
+      background: var(--primary);
+      border-radius: 50%;
+      pointer-events: none;
+      animation: float 3s infinite ease-in-out;
+      box-shadow: 0 0 10px var(--primary);
+    }
+
+    @keyframes float {
+      0%, 100% { transform: translateY(0) scale(1); opacity: 0.7; }
+      50% { transform: translateY(-20px) scale(1.3); opacity: 1; }
+    }
+  </style>
+</head>
+<body>
+
+  <canvas id="bg"></canvas>
+  <div class="container">
+    <h1>PitchMaster</h1>
+
+    <div class="card">
+      <button id="startBtn">🎤 开始检测</button>
+      <div class="status" id="status">点击按钮开始实时音准分析</div>
+    </div>
+
+    <div class="card">
+      <div class="pitch-display" id="note">--</div>
+      <div style="text-align:center;" class="cents" id="cents">±0 cents</div>
+    </div>
+
+    <div class="charts">
+      <canvas id="waveformChart"></canvas>
+      <canvas id="pitchChart"></canvas>
+    </div>
+  </div>
+
+  <script>
+    // === 全局变量 ===
+    let audioContext, analyser, dataArray, source, pitchModel, animationId;
+    let isRunning = false;
+    const noteStrings = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    const waveformCtx = document.getElementById('waveformChart').getContext('2d');
+    const pitchCtx = document.getElementById('pitchChart').getContext('2d');
+    let waveChart, pitchChart;
+
+    // === 初始化图表 ===
+    function initCharts() {
+      waveChart = new Chart(waveformCtx, {
+        type: 'line',
+        data: { labels: [], datasets: [{ data: [], borderColor: '#00f5ff', fill: false, tension: 0.1 }] },
+        options: { animation: false, scales: { y: { display: false }, x: { display: false } }, plugins: { legend: { display: false } } }
+      });
+
+      pitchChart = new Chart(pitchCtx, {
+        type: 'line',
+        data: { labels: [], datasets: [{ label: '实时音高 (Hz)', data: [], borderColor: '#ff00aa', fill: false }] },
+        options: {
+          animation: false,
+          scales: {
+            y: { min: 50, max: 1000, title: { display: true, text: '频率 (Hz)', color: '#aaa' } },
+            x: { display: false }
+          },
+          plugins: { legend: { display: false } }
+        }
+      });
+    }
+
+    // === 音符转换 ===
+    function freqToNote(freq) {
+      if (!freq || freq < 50) return { note: "--", cents: 0 };
+      const noteNum = 12 * (Math.log(freq / 440) / Math.log(2));
+      const rounded = Math.round(noteNum) + 69;
+      const note = noteStrings[rounded % 12];
+      const octave = Math.floor(rounded / 12) - 1;
+      const targetFreq = 440 * Math.pow(2, (rounded - 69)/12);
+      const cents = Math.floor(1200 * Math.log(freq / targetFreq) / Math.log(2));
+      return { note: `${note}${octave}`, cents };
+    }
+
+    // === 粒子背景 ===
+    function createParticle() {
+      const p = document.createElement('div');
+      p.classList.add('particle');
+      p.style.left = Math.random() * window.innerWidth + 'px';
+      p.style.top = Math.random() * window.innerHeight + 'px';
+      p.style.animationDelay = Math.random() * 3 + 's';
+      document.body.appendChild(p);
+      setTimeout(() => p.remove(), 3000);
+    }
+    setInterval(createParticle, 300);
+
+    // === 背景 canvas 动画 ===
+    const bgCanvas = document.getElementById('bg');
+    const bgCtx = bgCanvas.getContext('2d');
+    function resizeBg() {
+      bgCanvas.width = window.innerWidth;
+      bgCanvas.height = window.innerHeight;
+    }
+    resizeBg();
+    window.addEventListener('resize', resizeBg);
+
+    let time = 0;
+    function drawBg() {
+      bgCtx.clearRect(0, 0, bgCanvas.width, bgCanvas.height);
+      time += 0.01;
+      for (let i = 0; i < 3; i++) {
+        const x = Math.sin(time + i) * 200 + bgCanvas.width / 2;
+        const y = Math.cos(time + i) * 150 + bgCanvas.height / 2;
+        const grad = bgCtx.createRadialGradient(x, y, 0, x, y, 300);
+        grad.addColorStop(0, `rgba(${0*50}, ${245+i*30}, ${255-i*50}, 0.1)`);
+        grad.addColorStop(1, 'transparent');
+        bgCtx.fillStyle = grad;
+        bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
+      }
+      requestAnimationFrame(drawBg);
+    }
+    drawBg();
+
+    // === 主逻辑 ===
+    async function startPitchDetection() {
+      if (isRunning) return;
+      isRunning = true;
+
+      try {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        analyser = audioContext.createAnalyser();
+        analyser.fftSize = 2048;
+        dataArray = new Uint8Array(analyser.fftSize);
+
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        source = audioContext.createMediaStreamSource(stream);
+        source.connect(analyser);
+
+        // 加载 CREPE 模型
+        document.getElementById('status').textContent = '加载 AI 音高模型...';
+        pitchModel = await pitchDetection.create('CREPE', audioContext);
+
+        document.getElementById('status').textContent = '正在分析... 🎤';
+        detectPitch();
+      } catch (err) {
+        document.getElementById('status').textContent = '麦克风权限被拒绝或出错';
+        console.error(err);
+        isRunning = false;
+      }
+    }
+
+    let lastFreq = 0;
+    async function detectPitch() {
+      if (!isRunning) return;
+
+      const freq = await pitchModel.getPitch();
+      if (freq) {
+        lastFreq = freq;
+        const { note, cents } = freqToNote(freq);
+        document.getElementById('note').textContent = note;
+        document.getElementById('cents').textContent = `${cents >= 0 ? '+' : ''}${cents} cents`;
+
+        // 更新波形
+        analyser.getByteTimeDomainData(dataArray);
+        const waveData = Array.from(dataArray).map(v => (v - 128) / 128);
+        waveChart.data.labels = waveData.map((_, i) => i);
+        waveChart.data.datasets[0].data = waveData;
+        waveChart.update('quiet');
+
+        // 更新音高曲线
+        pitchChart.data.labels.push('');
+        pitchChart.data.datasets[0].data.push(freq);
+        if (pitchChart.data.labels.length > 100) {
+          pitchChart.data.labels.shift();
+          pitchChart.data.datasets[0].data.shift();
+        }
+        pitchChart.update('quiet');
+      }
+
+      animationId = requestAnimationFrame(detectPitch);
+    }
+
+    // === 启动按钮 ===
+    document.getElementById('startBtn').addEventListener('click', async () => {
+      if (!isRunning) {
+        await startPitchDetection();
+        document.getElementById('startBtn').textContent = '⏹ 停止';
+      } else {
+        isRunning = false;
+        cancelAnimationFrame(animationId);
+        if (source) source.disconnect();
+        if (audioContext) audioContext.close();
+        document.getElementById('status').textContent = '已停止';
+        document.getElementById('startBtn').textContent = '🎤 开始检测';
+        document.getElementById('note').textContent = '--';
+        document.getElementById('cents').textContent = '±0 cents';
+      }
+    });
+
+    // === 初始化 ===
+    initCharts();
+  </script>
+</body>
+</html>
